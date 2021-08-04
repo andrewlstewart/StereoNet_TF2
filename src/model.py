@@ -8,20 +8,18 @@ import tensorflow as tf
 
 
 class StereoNet(tf.keras.models.Model):
-    """
+    """ Lifted heavily from https://github.com/zhixuanli/StereoNet
     """
 
-    def __init__(self, k: int = 3, r: int = 3, max_disp: int = 192):
+    def __init__(self, k: int = 4, max_disp: int = 192):
         super().__init__(name='')
 
         self.k = k
-        self.r = r
         self.max_disp = max_disp
         self.disp = (self.max_disp + 1) // (2**self.k)
 
         self.feature_extraction = get_downsampling_feature_network(k=self.k)
         self.cost_volume = get_cost_volume_network(k=4)
-        # self.disparity_regression = get_disparity_regression_network(self.disp)
         self.edge_aware_refinement = EdgeAwareRefinement(k=4)
 
     def call(self, left, right, training=False):
@@ -39,27 +37,51 @@ class StereoNet(tf.keras.models.Model):
         cost = self.cost_volume(cost, training=training)
         cost = tf.squeeze(cost, axis=-1)
 
-        pred = tf.keras.layers.Softmax(axis=1)(cost)
+        b, d, h, w = tf.shape(cost)
+        disp_initial_l = tf.squeeze(tf.image.resize(tf.reshape(cost, (-1, h, w))[..., tf.newaxis], size=left.shape[1:3]), axis=-1)
+        
+        pred_initial_l = tf.reshape(disp_initial_l, (b, d, tf.shape(left)[1], tf.shape(left)[2]))
 
-        # Disparity regression
-        disp = tf.reshape(tf.range(self.disp, dtype=tf.float32), (1, self.disp, 1, 1))
-        disp = tf.repeat(tf.repeat(tf.repeat(disp, pred.shape[0], axis=0), pred.shape[2], axis=2), pred.shape[3], axis=3)  # This feels very inelegant
-        pred = tf.reduce_sum(tf.math.multiply(disp, pred), axis=1)
+        disp_initial_l = soft_argmin(pred_initial_l, self.disp)
 
-        pred_bottom = pred * left.shape[2] / pred.shape[2]
-        pred_bottom = tf.image.resize(pred_bottom[..., tf.newaxis], size=left.shape[1:3])
-        pred_bottom = tf.squeeze(pred_bottom, axis=-1)
+        disp_refined_l = self.edge_aware_refinement(disp_initial_l[..., tf.newaxis], left)
 
-        pred_top = self.edge_aware_refinement(pred, left)
+        return disp_refined_l
 
-        pred_pyramid = tf.TensorArray(tf.float32, size=2)
-        pred_pyramid.write(0, pred_bottom)
-        pred_pyramid.write(1, pred_top)
+        # pred = tf.keras.layers.Softmax(axis=1)(cost)
 
-        pred_pyramid = pred_pyramid.stack()
-        pred_pyramid = tf.transpose(pred_pyramid, perm=[1, 2, 3, 0])
+        # # Disparity regression
+        # disp = tf.reshape(tf.range(self.disp, dtype=tf.float32), (1, self.disp, 1, 1))
+        # disp = tf.repeat(tf.repeat(tf.repeat(disp, pred.shape[0], axis=0), pred.shape[2], axis=2), pred.shape[3], axis=3)  # This feels very inelegant
+        # pred = tf.reduce_sum(tf.math.multiply(disp, pred), axis=1)
 
-        return pred_pyramid
+        # pred_bottom = pred * left.shape[2] / pred.shape[2]
+        # pred_bottom = tf.image.resize(pred_bottom[..., tf.newaxis], size=left.shape[1:3])
+        # pred_bottom = tf.squeeze(pred_bottom, axis=-1)
+
+        # pred_top = self.edge_aware_refinement(pred, left)
+
+        # pred_pyramid = tf.TensorArray(tf.float32, size=2)
+        # pred_pyramid.write(0, pred_bottom)
+        # pred_pyramid.write(1, pred_top)
+
+        # pred_pyramid = pred_pyramid.stack()
+        # pred_pyramid = tf.transpose(pred_pyramid, perm=[1, 2, 3, 0])
+
+        # return pred_pyramid
+
+
+def soft_argmin(cost_volume, grid_size):
+    disp_softmax = tf.keras.layers.Softmax(axis=1)(cost_volume)
+
+    disp_grid = tf.reshape(tf.range(grid_size, dtype=tf.float32), (1, grid_size, 1, 1))
+    disp_grid = tf.repeat(tf.repeat(tf.repeat(disp_grid, cost_volume.shape[0], axis=0), cost_volume.shape[2], axis=2), cost_volume.shape[3], axis=3)  # This feels very inelegant
+
+    arg_soft_min = tf.reduce_sum(tf.math.multiply(disp_grid, cost_volume), axis=1)
+
+    return arg_soft_min
+
+
 
 
 class ResBlock(tf.keras.models.Model):
@@ -100,7 +122,7 @@ class ResBlock(tf.keras.models.Model):
         return x + input_tensor
 
 
-def get_downsampling_feature_network(k: int = 3) -> tf.keras.models.Model:
+def get_downsampling_feature_network(k: int = 4) -> tf.keras.models.Model:
     model = tf.keras.models.Sequential()
 
     model.add(tf.keras.layers.InputLayer(input_shape=(None, None, 3)))
@@ -158,11 +180,11 @@ class EdgeAwareRefinement(tf.keras.models.Model):
                                                       ])
 
     def call(self, disp, colour):
-        _, _, original_disp_h = tf.shape(disp)
-        disp = tf.image.resize(disp[..., tf.newaxis], size=tf.shape(colour)[1:3])
+        # _, _, original_disp_h = tf.shape(disp)
+        # disp = tf.image.resize(disp[..., tf.newaxis], size=tf.shape(colour)[1:3])
 
-        if tf.shape(colour)[2] / original_disp_h >= 1.5:
-            disp *= 8
+        # if tf.shape(colour)[2] / original_disp_h >= 1.5:
+            # disp *= 8
 
         output = tf.concat([disp, colour], axis=-1)
         output = self.feature_conv(output)
@@ -172,7 +194,7 @@ class EdgeAwareRefinement(tf.keras.models.Model):
         output += disp
 
         output = tf.keras.activations.relu(output)
-        output = tf.squeeze(output, axis=-1)
+        # output = tf.squeeze(output, axis=-1)
         
         return output
 
@@ -180,8 +202,10 @@ class EdgeAwareRefinement(tf.keras.models.Model):
 def main():
     import numpy as np
 
-    stereo_net = StereoNet(k=3, r=3, max_disp=192)
-    out = stereo_net(left=np.random.random((1, 540, 960, 3)), right=np.random.random((1, 540, 960, 3)))
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.1)
+
+    stereo_net = StereoNet(k=4, max_disp=192)
+    out = stereo_net(left=np.random.random((2, 540, 960, 3)), right=np.random.random((2, 540, 960, 3)))
 
     print('stall')
 
