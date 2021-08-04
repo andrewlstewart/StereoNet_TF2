@@ -39,7 +39,7 @@ class StereoNet(tf.keras.models.Model):
 
         b, d, h, w = tf.shape(cost)
         disp_initial_l = tf.squeeze(tf.image.resize(tf.reshape(cost, (-1, h, w))[..., tf.newaxis], size=left.shape[1:3]), axis=-1)
-        
+
         pred_initial_l = tf.reshape(disp_initial_l, (b, d, tf.shape(left)[1], tf.shape(left)[2]))
 
         disp_initial_l = soft_argmin(pred_initial_l, self.disp)
@@ -47,28 +47,6 @@ class StereoNet(tf.keras.models.Model):
         disp_refined_l = self.edge_aware_refinement(disp_initial_l[..., tf.newaxis], left)
 
         return disp_refined_l
-
-        # pred = tf.keras.layers.Softmax(axis=1)(cost)
-
-        # # Disparity regression
-        # disp = tf.reshape(tf.range(self.disp, dtype=tf.float32), (1, self.disp, 1, 1))
-        # disp = tf.repeat(tf.repeat(tf.repeat(disp, pred.shape[0], axis=0), pred.shape[2], axis=2), pred.shape[3], axis=3)  # This feels very inelegant
-        # pred = tf.reduce_sum(tf.math.multiply(disp, pred), axis=1)
-
-        # pred_bottom = pred * left.shape[2] / pred.shape[2]
-        # pred_bottom = tf.image.resize(pred_bottom[..., tf.newaxis], size=left.shape[1:3])
-        # pred_bottom = tf.squeeze(pred_bottom, axis=-1)
-
-        # pred_top = self.edge_aware_refinement(pred, left)
-
-        # pred_pyramid = tf.TensorArray(tf.float32, size=2)
-        # pred_pyramid.write(0, pred_bottom)
-        # pred_pyramid.write(1, pred_top)
-
-        # pred_pyramid = pred_pyramid.stack()
-        # pred_pyramid = tf.transpose(pred_pyramid, perm=[1, 2, 3, 0])
-
-        # return pred_pyramid
 
 
 def soft_argmin(cost_volume, grid_size):
@@ -80,8 +58,6 @@ def soft_argmin(cost_volume, grid_size):
     arg_soft_min = tf.reduce_sum(tf.math.multiply(disp_grid, cost_volume), axis=1)
 
     return arg_soft_min
-
-
 
 
 class ResBlock(tf.keras.models.Model):
@@ -184,7 +160,7 @@ class EdgeAwareRefinement(tf.keras.models.Model):
         # disp = tf.image.resize(disp[..., tf.newaxis], size=tf.shape(colour)[1:3])
 
         # if tf.shape(colour)[2] / original_disp_h >= 1.5:
-            # disp *= 8
+        # disp *= 8
 
         output = tf.concat([disp, colour], axis=-1)
         output = self.feature_conv(output)
@@ -195,7 +171,7 @@ class EdgeAwareRefinement(tf.keras.models.Model):
 
         output = tf.keras.activations.relu(output)
         # output = tf.squeeze(output, axis=-1)
-        
+
         return output
 
 
