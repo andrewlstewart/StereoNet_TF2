@@ -1,115 +1,148 @@
 """
 """
 
+from typing import Optional
 from pathlib import Path
-from glob import glob
+import random
+import argparse
 
 import tensorflow as tf
 
-import utils
+import src.utils as utils
 
 
-def parse_image(filename: Path) -> None:
-    image = tf.io.read_file(filename)
-    image = tf.image.decode_png(image)
-    return image
+def make_dataset(sceneflow_path: str,
+                 string_exclude: Optional[str] = None,
+                 string_include: Optional[str] = None,
+                 shuffle: bool = False) -> tf.data.Dataset:
+    """ 
+    string_exclude: If this string appears in the parent path of an image, don't add them to the dataset
+    string_include: If this string DOES NOT appear in the parent path of an image, don't add them to the dataset
+    """
 
-def parse_disp(filename: Path) -> None:
-    return utils.read_PFM(filename)
+    left_image_path = []
+    right_image_path = []
+    left_disp_path = []
 
+    # For each left image, do some path manipulation to find the corresponding right
+    # image and left disparity.
+    sceneflow_path = Path(sceneflow_path)
+    for path in sceneflow_path.rglob('*.png'):
+        if not 'left' in path.parts:
+            continue
 
-def make_dataset(sceneflow_path: Path, batch_size: int) -> tf.data.Dataset:
-    
-    # ========================= flying =======================
-    path = sceneflow_path / 'frames_cleanpass' / 'TRAIN'
+        if string_exclude and string_exclude in path.parts:
+            continue
+        if string_include and string_include not in path.parts:
+            continue
 
-    left_image_filenames = list(path.glob('*/*/left/*.png'))
-    right_image_filenames = [p.parents[1] / 'right' / p.name for p in left_image_filenames]
-    left_disp_filenames = [(p.parents[5] / 'disparity' / p.relative_to(p.parents[4])).with_suffix('.pfm') for p in left_image_filenames]
+        r_path = Path("\\".join(['right' if 'left' in part else part for part in path.parts]))
+        d_path = Path("\\".join([f'{part.replace("frames_cleanpass","")}disparity' if 'frames_cleanpass' in part else part for part in path.parts])).with_suffix('.tensor')
+        # assert r_path.exists()
+        # assert d_path.exists()
 
-    left_image_filenames = [str(p) for p in left_image_filenames]
-    right_image_filenames = [str(p) for p in right_image_filenames]
-    left_disp_filenames = [str(p) for p in left_disp_filenames]
+        if not r_path.exists() or not d_path.exists():
+            continue
+
+        left_image_path.append(path)
+        right_image_path.append(r_path)
+        left_disp_path.append(d_path)
+
+    # Tensorflow hates Path objects
+    left_image_filenames = [str(p) for p in left_image_path]
+    right_image_filenames = [str(p) for p in right_image_path]
+    left_disp_filenames = [str(p) for p in left_disp_path]
+
+    if shuffle:
+        random_list = [random.random() for _ in left_image_filenames]
+
+        def shuffler(random_list):
+            for random in random_list:
+                yield random
+        # Because the following shufflers are all using the same random_list, they will yield
+        # the same values.  Use this as the key to 'sort' (ie. shuffle).
+        # https://stackoverflow.com/a/67598880
+        left_shuffler = shuffler(random_list)
+        right_shuffler = shuffler(random_list)
+        disp_shuffler = shuffler(random_list)
+
+        left_image_filenames = sorted(left_image_filenames, key=lambda _: next(left_shuffler))
+        right_image_filenames = sorted(right_image_filenames, key=lambda _: next(right_shuffler))
+        left_disp_filenames = sorted(left_disp_filenames, key=lambda _: next(disp_shuffler))
 
     left_image_filenames_ds = tf.data.Dataset.from_tensor_slices(left_image_filenames)
     right_image_filenames_ds = tf.data.Dataset.from_tensor_slices(right_image_filenames)
     left_disp_filenames_ds = tf.data.Dataset.from_tensor_slices(left_disp_filenames)
-    
-    left_image_ds = left_image_filenames_ds.map(parse_image, num_parallel_calls=tf.data.AUTOTUNE)
-    right_image_ds = right_image_filenames_ds.map(parse_image, num_parallel_calls=tf.data.AUTOTUNE)
-    left_disp_ds = left_disp_filenames_ds.map(parse_disp, num_parallel_calls=tf.data.AUTOTUNE)
-    
+
+    left_image_ds = left_image_filenames_ds.map(utils.read_image, num_parallel_calls=tf.data.AUTOTUNE)
+    right_image_ds = right_image_filenames_ds.map(utils.read_image, num_parallel_calls=tf.data.AUTOTUNE)
+    left_disp_ds = left_disp_filenames_ds.map(utils.read_PFM_tensor, num_parallel_calls=tf.data.AUTOTUNE)
+
     image_ds = tf.data.Dataset.zip((left_image_ds, right_image_ds))
     ds = tf.data.Dataset.zip((image_ds, left_disp_ds))
-    
+
     return ds
 
 
-path = Path(r'C:\Users\andre\Documents\Python\StereoNet_TF2\data\SceneFlow')
-make_dataset(path, 4)
-
-IMG_SIZE = 540
-
-def make_dataset(path, batch_size):
-
-  def parse_image(filename):
-    image = tf.io.read_file(filename)
-    image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE])
+def rescale(image: tf.Tensor):
+    image = tf.cast(image, tf.float32)
+    image = (image / 127.5) - 1
     return image
 
-  def configure_for_performance(ds):
-    ds = ds.shuffle(buffer_size=1000)
-    ds = ds.batch(batch_size)
-    ds = ds.repeat()
-    ds = ds.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
-    return ds
 
-  classes = os.listdir(path)
-  filenames = glob(path + '/*/*/*')
-#   random.shuffle(filenames)
-#   labels = [classes.index(name.split('/')[-2]) for name in filenames]
+def augmentations(batch: tf.Tensor, seed: tf.Tensor, config: argparse.Namespace) -> tf.Tensor:
+    """
+    Currently only performing the same random crop on the left, right, and disparity maps
+    """
+    (left, right), disp = batch
 
-  filenames_ds = tf.data.Dataset.from_tensor_slices(filenames)
-  images_ds = filenames_ds.map(parse_image, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  labels_ds = tf.data.Dataset.from_tensor_slices(labels)
-  ds = tf.data.Dataset.zip((images_ds, labels_ds))
-  ds = configure_for_performance(ds)
+    # Randomly crop.  Passing the same seed to all crop functions 'should' get the same cropped regions
+    # left = tf.image.stateless_random_crop(left, size=[left.shape[0], spatial_crop_shape[0], spatial_crop_shape[1], left.shape[3]], seed=seed)
+    # right = tf.image.stateless_random_crop(right, size=[right.shape[0], spatial_crop_shape[0], spatial_crop_shape[1], right.shape[3]], seed=seed)
+    # disp = tf.image.stateless_random_crop(disp, size=[disp.shape[0], spatial_crop_shape[0], spatial_crop_shape[1], disp.shape[3]], seed=seed)
 
-  return ds
+    left = tf.image.stateless_random_crop(left, size=(config.batch_size, config.crop_size[0], config.crop_size[1], 3), seed=seed)
+    right = tf.image.stateless_random_crop(right, size=(config.batch_size, config.crop_size[0], config.crop_size[1], 3), seed=seed)
+    disp = tf.image.stateless_random_crop(disp, size=(config.batch_size, config.crop_size[0], config.crop_size[1], 1), seed=seed)
 
-make_dataset(r'C:\Users\andre\Documents\Python\StereoNet_TF2\data\SceneFlow\frames_cleanpass\TRAIN\A', 4)
-
-def get_scene_flow(path: Path) -> tf.data:
-    # https://lmb.informatik.uni-freiburg.de/resources/datasets/SceneFlowDatasets.en.html#downloads
-    # https://github.com/JiaRenChang/PSMNet
-    pass
+    return (left, right), disp
 
 
-def get_kitti_2015(path: Path) -> tf.data:
+def dataset_prepare(ds: tf.data.Dataset,
+                    config: Optional[argparse.Namespace] = None,
+                    apply_augmentations: bool = False) -> tf.data.Dataset:
+    """
+    https://www.tensorflow.org/tutorials/images/data_augmentation#apply_the_preprocessing_layers_to_the_datasets
+    """
 
-    left_img_path = path / 'image_2'
-    right_img_path = path / 'image_3'
-    left_disp_path = path / 'disp_occ_0'
-    right_disp_path = path / 'disp_occ_1'
+    ds = ds.map(lambda images, disp: ((rescale(images[0]), rescale(images[1])), disp))
 
-    for file_path in left_img_path.glob('*'):
-        a=1
+    if config.shuffle_buffer:
+        ds = ds.shuffle(config.shuffle_buffer, reshuffle_each_iteration=True)
 
-    datasets = {}
-    for name, path in [('left_img', left_img_path), ('right_img', right_img_path), ('left_disp', left_disp_path), ('right_disp', right_disp_path)]:
-        datasets[name] = tf.keras.preprocessing.image_dataset_from_directory(path,
-                                                                             label_mode=None,
-                                                                             shuffle=False,
-                                                                             image_size=(375, 1242),
-                                                                             batch_size=1)
+    ds = ds.batch(config.batch_size)
 
-    print('stall')
+    if apply_augmentations:
+        counter = tf.data.experimental.Counter()
+        ds = tf.data.Dataset.zip((ds, (counter, counter)))
+        ds = ds.map(lambda inst, seed: augmentations(inst, seed, config), num_parallel_calls=tf.data.AUTOTUNE)
+
+    return ds.prefetch(buffer_size=tf.data.AUTOTUNE)
 
 
 def main():
-    root_path = Path.cwd() / 'data' / 'Kitti_2015' / 'data_scene_flow' / 'training'
-    ds = get_kitti_2015(root_path)
+
+    config = utils.parse_args()
+
+    train_ds = make_dataset(config.data_root_path, string_exclude='TEST', shuffle=True)
+    val_ds = make_dataset(config.data_root_path, string_include='TEST')
+
+    train_ds = dataset_prepare(train_ds, config, apply_augmentations=True)
+    val_ds = dataset_prepare(val_ds, config)
+
+    for b in train_ds:
+        utils.plot_batch(b, show=True)
+        break
 
 
 if __name__ == "__main__":

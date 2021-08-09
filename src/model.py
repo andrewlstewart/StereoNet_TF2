@@ -11,19 +11,18 @@ class StereoNet(tf.keras.models.Model):
     """ Lifted heavily from https://github.com/zhixuanli/StereoNet
     """
 
-    def __init__(self, k: int = 4, max_disp: int = 192):
+    def __init__(self, k: int = 4, candidate_disparities: int = 192):
         super().__init__(name='')
 
         self.k = k
-        self.max_disp = max_disp
-        self.disp = (self.max_disp + 1) // (2**self.k)
+        self.disp = (candidate_disparities + 1) // (2**self.k)
 
         self.feature_extraction = get_downsampling_feature_network(k=self.k)
         self.cost_volume = get_cost_volume_network(k=4)
         self.edge_aware_refinement = EdgeAwareRefinement(k=4)
 
-    def call(self, left, right, training=False):
-
+    def call(self, x, training=False):
+        left, right = x
         reference_embedding = self.feature_extraction(left, training=training)
         target_embedding = self.feature_extraction(right, training=training)
 
@@ -37,10 +36,10 @@ class StereoNet(tf.keras.models.Model):
         cost = self.cost_volume(cost, training=training)
         cost = tf.squeeze(cost, axis=-1)
 
-        b, d, h, w = tf.shape(cost)
-        disp_initial_l = tf.squeeze(tf.image.resize(tf.reshape(cost, (-1, h, w))[..., tf.newaxis], size=left.shape[1:3]), axis=-1)
+        # b, d, h, w = tf.shape(cost)
+        disp_initial_l = tf.squeeze(tf.image.resize(tf.reshape(cost, (-1, tf.shape(cost)[2], tf.shape(cost)[3]))[..., tf.newaxis], size=left.shape[1:3]), axis=-1)
 
-        pred_initial_l = tf.reshape(disp_initial_l, (b, d, tf.shape(left)[1], tf.shape(left)[2]))
+        pred_initial_l = tf.reshape(disp_initial_l, (tf.shape(cost)[0], tf.shape(cost)[1], tf.shape(left)[1], tf.shape(left)[2]))
 
         disp_initial_l = soft_argmin(pred_initial_l, self.disp)
 
@@ -180,8 +179,10 @@ def main():
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.1)
 
-    stereo_net = StereoNet(k=4, max_disp=192)
-    out = stereo_net(left=np.random.random((2, 540, 960, 3)), right=np.random.random((2, 540, 960, 3)))
+    stereo_net = StereoNet(k=4, candidate_disparities=192)
+    left = np.random.random((2, 540, 960, 3))
+    right = np.random.random((2, 540, 960, 3))
+    out = stereo_net((left, right))
 
     print('stall')
 
